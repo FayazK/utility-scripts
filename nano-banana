@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Generate images via Google's Nano Banana (Gemini image) models."""
+
+import argparse
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+MODELS = {
+    "2": "gemini-3.1-flash-image-preview",
+    "pro": "gemini-3-pro-image-preview",
+}
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=(
+            "Generate images with Google's Nano Banana (Gemini image-generation) "
+            "models. Supports text-to-image and image+text-to-image (reference "
+            "images) with configurable resolution and aspect ratio."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("prompt", help="Text prompt describing the image to generate.")
+    p.add_argument(
+        "-o", "--output-dir", required=True,
+        help="Directory to write generated PNG(s) into. Created if missing.",
+    )
+    p.add_argument(
+        "-m", "--model", choices=list(MODELS), default="2",
+        help="Model variant: '2' = Nano Banana 2 (Flash), 'pro' = Nano Banana Pro.",
+    )
+    p.add_argument(
+        "-s", "--size", choices=["1K", "2K", "4K"], default="2K",
+        help="Output image resolution.",
+    )
+    p.add_argument(
+        "-a", "--aspect-ratio", default="1:1",
+        help="Aspect ratio, e.g. 1:1, 16:9, 9:16, 3:2, 2:3, 4:3, 3:4, 4:5, 5:4, 21:9.",
+    )
+    p.add_argument(
+        "-r", "--reference", action="append", default=[], metavar="PATH",
+        help="Path to a reference image. Repeat flag to pass multiple (up to 14).",
+    )
+    p.add_argument(
+        "-n", "--name", default=None,
+        help="Output filename stem (no extension). Defaults to a timestamp.",
+    )
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if not os.environ.get("GEMINI_API_KEY"):
+        sys.exit("error: GEMINI_API_KEY is not set in the environment.")
+
+    ref_paths = [Path(r).expanduser() for r in args.reference]
+    for rp in ref_paths:
+        if not rp.is_file():
+            sys.exit(f"error: reference image not found: {rp}")
+
+    out_dir = Path(args.output_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    from google import genai
+    from google.genai import types
+    from PIL import Image
+
+    contents = [args.prompt] + [Image.open(rp) for rp in ref_paths]
+
+    config = types.GenerateContentConfig(
+        image_config=types.ImageConfig(
+            aspect_ratio=args.aspect_ratio,
+            image_size=args.size,
+        ),
+    )
+
+    client = genai.Client()
+    response = client.models.generate_content(
+        model=MODELS[args.model],
+        contents=contents,
+        config=config,
+    )
+
+    stem = args.name or datetime.now().strftime("nano-banana-%Y%m%d-%H%M%S")
+
+    images = []
+    texts = []
+    for part in response.parts:
+        if getattr(part, "text", None):
+            texts.append(part.text)
+        elif getattr(part, "inline_data", None) is not None:
+            images.append(part.as_image())
+
+    if texts:
+        print("\n".join(texts))
+
+    if not images:
+        sys.exit("error: no image returned by the model.")
+
+    saved = []
+    for i, img in enumerate(images):
+        suffix = "" if len(images) == 1 else f"-{i + 1}"
+        path = out_dir / f"{stem}{suffix}.png"
+        img.save(path)
+        saved.append(path)
+
+    for p in saved:
+        print(p)
+
+
+if __name__ == "__main__":
+    main()
