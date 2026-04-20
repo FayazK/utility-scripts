@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Generate videos via ByteDance's Seedance 2.0 models on Replicate."""
+
+import argparse
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+MODELS = {
+    "pro": "bytedance/seedance-2.0",
+    "lite": "bytedance/seedance-2.0-fast",
+}
+
+ASPECT_RATIOS = ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21", "adaptive"]
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=(
+            "Generate videos with ByteDance Seedance 2.0 (Pro or Lite/Fast) "
+            "via the Replicate API. Supports text-to-video, image-to-video, "
+            "first+last frame interpolation, and reference images/videos/"
+            "audios for character, style, motion, and lip-sync control."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("prompt", help="Text prompt for video generation.")
+    p.add_argument(
+        "-o", "--output-dir", required=True,
+        help="Directory to write generated MP4 into. Created if missing.",
+    )
+    p.add_argument(
+        "-m", "--model", choices=list(MODELS), default="lite",
+        help="Model variant: 'pro' = seedance-2.0, 'lite' = seedance-2.0-fast.",
+    )
+    p.add_argument(
+        "-d", "--duration", type=int, default=5,
+        help="Video duration in seconds (-1..15). Use -1 for intelligent duration.",
+    )
+    p.add_argument(
+        "-s", "--resolution", choices=["480p", "720p"], default="720p",
+        help="Video resolution.",
+    )
+    p.add_argument(
+        "-a", "--aspect-ratio", choices=ASPECT_RATIOS, default="16:9",
+        help="Video aspect ratio. 'adaptive' lets the model choose.",
+    )
+    p.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed for reproducible generation.",
+    )
+    p.add_argument(
+        "--no-audio", action="store_true",
+        help="Disable synchronized audio generation (audio is on by default).",
+    )
+    p.add_argument(
+        "-i", "--image", default=None, metavar="PATH_OR_URL",
+        help="First-frame image for image-to-video. Local path or URL.",
+    )
+    p.add_argument(
+        "-l", "--last-frame", default=None, metavar="PATH_OR_URL",
+        help="Last-frame image for interpolation. Requires --image.",
+    )
+    p.add_argument(
+        "--ref-image", action="append", default=[], metavar="PATH_OR_URL",
+        help="Reference image (up to 9). Repeat flag. Refer to in prompt as [Image1], [Image2]...",
+    )
+    p.add_argument(
+        "--ref-video", action="append", default=[], metavar="PATH_OR_URL",
+        help="Reference video (up to 3, total ≤15s). Repeat flag. Refer as [Video1]...",
+    )
+    p.add_argument(
+        "--ref-audio", action="append", default=[], metavar="PATH_OR_URL",
+        help="Reference audio (up to 3, total ≤15s). Repeat flag. Refer as [Audio1]...",
+    )
+    p.add_argument(
+        "-n", "--name", default=None,
+        help="Output filename stem (no extension). Defaults to a timestamp.",
+    )
+    return p.parse_args()
+
+
+def _is_uri(s: str) -> bool:
+    return s.startswith(("http://", "https://", "data:"))
+
+
+def _resolve_media(ref: str, label: str):
+    """Return a file handle for a local path, or the URI string as-is.
+
+    Replicate's SDK uploads file-like objects automatically, so we don't
+    need to pre-upload. Caller is responsible for closing handles.
+    """
+    if _is_uri(ref):
+        return ref
+    path = Path(ref).expanduser()
+    if not path.is_file():
+        sys.exit(f"error: {label} not found: {path}")
+    return path.open("rb")
+
+
+def main():
+    args = parse_args()
+
+    if not os.environ.get("REPLICATE_API_TOKEN"):
+        sys.exit("error: REPLICATE_API_TOKEN is not set in the environment.")
+
+    # Validation mirroring the model schema.
+    if args.last_frame and not args.image:
+        sys.exit("error: --last-frame requires --image.")
+    if (args.image or args.last_frame) and args.ref_image:
+        sys.exit("error: --image/--last-frame cannot be combined with --ref-image.")
+    if not (-1 <= args.duration <= 15):
+        sys.exit("error: --duration must be between -1 and 15.")
+    if len(args.ref_image) > 9:
+        sys.exit("error: at most 9 --ref-image values allowed.")
+    if len(args.ref_video) > 3:
+        sys.exit("error: at most 3 --ref-video values allowed.")
+    if len(args.ref_audio) > 3:
+        sys.exit("error: at most 3 --ref-audio values allowed.")
+    if args.ref_audio and not (args.ref_image or args.ref_video or args.image):
+        sys.exit("error: --ref-audio requires at least one --ref-image, --ref-video, or --image.")
+
+    out_dir = Path(args.output_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    import replicate
+
+    payload = {
+        "prompt": args.prompt,
+        "duration": args.duration,
+        "resolution": args.resolution,
+        "aspect_ratio": args.aspect_ratio,
+        "generate_audio": not args.no_audio,
+    }
+    if args.seed is not None:
+        payload["seed"] = args.seed
+
+    opened = []  # track file handles to close after the run
+
+    def add_media(key: str, value, label: str, multi: bool = False):
+        resolved = _resolve_media(value, label) if not multi else [
+            _resolve_media(v, label) for v in value
+        ]
+        if multi:
+            for r in resolved:
+                if hasattr(r, "read"):
+                    opened.append(r)
+            if resolved:
+                payload[key] = resolved
+        else:
+            if hasattr(resolved, "read"):
+                opened.append(resolved)
+            payload[key] = resolved
+
+    if args.image:
+        add_media("image", args.image, "--image")
+    if args.last_frame:
+        add_media("last_frame_image", args.last_frame, "--last-frame")
+    if args.ref_image:
+        add_media("reference_images", args.ref_image, "--ref-image", multi=True)
+    if args.ref_video:
+        add_media("reference_videos", args.ref_video, "--ref-video", multi=True)
+    if args.ref_audio:
+        add_media("reference_audios", args.ref_audio, "--ref-audio", multi=True)
+
+    model_slug = MODELS[args.model]
+
+    try:
+        output = replicate.run(model_slug, input=payload)
+    finally:
+        for fh in opened:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+    stem = args.name or datetime.now().strftime("seedance-%Y%m%d-%H%M%S")
+    path = out_dir / f"{stem}.mp4"
+
+    with open(path, "wb") as f:
+        f.write(output.read())
+
+    print(path)
+
+
+if __name__ == "__main__":
+    main()

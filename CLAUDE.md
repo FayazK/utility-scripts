@@ -9,7 +9,7 @@ This directory holds global Python scripts — standalone utilities intended to 
 ## Environment
 
 - A Python virtualenv is already activated globally in the user's shell. Do **not** create a new venv, run `python -m venv`, or prepend `source .../activate` to commands. Just invoke `python` / `pip` directly.
-- Install dependencies with plain `pip install <pkg>`. If a script grows real dependencies, add a `requirements.txt` at the repo root so the global env stays reproducible.
+- Install dependencies with `uv pip install <pkg>` (the global `~/.venv` has no `pip` module — do not call `pip` or `python -m pip`). If a script grows real dependencies, add a `requirements.txt` at the repo root so the global env stays reproducible.
 
 ## Conventions for scripts here
 
