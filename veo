@@ -99,15 +99,21 @@ def main():
     if args.person_generation:
         config_kwargs["person_generation"] = args.person_generation
 
-    # Load images if provided.
-    image = None
-    if image_path:
-        from PIL import Image
-        image = Image.open(image_path)
+    # Load images if provided. The Veo API needs image bytes + mime type
+    # explicitly — passing a PIL image directly fails with INVALID_ARGUMENT
+    # ("should contain both bytesBase64Encoded and mimeType").
+    import mimetypes
 
+    def _load_as_genai_image(path: Path):
+        mime, _ = mimetypes.guess_type(str(path))
+        if mime is None:
+            # Fall back to PNG if extension is unknown.
+            mime = "image/png"
+        return types.Image(image_bytes=path.read_bytes(), mime_type=mime)
+
+    image = _load_as_genai_image(image_path) if image_path else None
     if last_frame_path:
-        from PIL import Image as PILImage
-        config_kwargs["last_frame"] = PILImage.open(last_frame_path)
+        config_kwargs["last_frame"] = _load_as_genai_image(last_frame_path)
 
     config = types.GenerateVideosConfig(**config_kwargs)
 
@@ -131,7 +137,25 @@ def main():
     stem = args.name or datetime.now().strftime("veo-%Y%m%d-%H%M%S")
     path = out_dir / f"{stem}.mp4"
 
-    video = operation.response.generated_videos[0]
+    # Surface a useful error if generation produced no video (e.g. blocked
+    # by safety filters). The default AttributeError on .generated_videos is
+    # opaque — print whatever the server returned.
+    response = operation.response
+    if response is None or not getattr(response, "generated_videos", None):
+        err = getattr(operation, "error", None)
+        print("error: Veo returned no videos.", file=sys.stderr)
+        if err:
+            print(f"  operation.error: {err}", file=sys.stderr)
+        if response is not None:
+            for attr in ("rai_media_filtered_count", "rai_media_filtered_reasons"):
+                val = getattr(response, attr, None)
+                if val is not None:
+                    print(f"  response.{attr}: {val}", file=sys.stderr)
+            # Dump the raw response for visibility.
+            print(f"  raw response: {response}", file=sys.stderr)
+        sys.exit(1)
+
+    video = response.generated_videos[0]
     client.files.download(file=video.video)
     video.video.save(str(path))
 
