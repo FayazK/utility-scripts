@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Generate videos via xAI's Grok Imagine (grok-imagine-video) model."""
+
+import argparse
+import base64
+import mimetypes
+import os
+import sys
+import urllib.request
+from datetime import datetime, timedelta
+from pathlib import Path
+
+MODEL = "grok-imagine-video"
+ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"]
+RESOLUTIONS = ["480p", "720p"]
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=(
+            "Generate videos with xAI's Grok Imagine (grok-imagine-video) "
+            "via the xai-sdk. Supports text-to-video, image-to-video, "
+            "reference-to-video (with multiple reference images), "
+            "video editing, and video extension. Local image/video paths "
+            "are uploaded as base64 data URIs; https:// URLs are passed "
+            "through as-is."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("prompt", help="Text prompt describing the video.")
+    p.add_argument(
+        "-o", "--output-dir", required=True,
+        help="Directory to write the generated MP4 into. Created if missing.",
+    )
+    p.add_argument(
+        "-d", "--duration", type=int, default=None,
+        help="Video duration in seconds (1-15). For --extend-video, this is "
+             "the length of the added portion only. Default: model default.",
+    )
+    p.add_argument(
+        "-a", "--aspect-ratio", choices=ASPECT_RATIOS, default=None,
+        help="Video aspect ratio. Ignored for --edit-video and --extend-video.",
+    )
+    p.add_argument(
+        "-s", "--resolution", choices=RESOLUTIONS, default=None,
+        help="Video resolution. Ignored for --edit-video and --extend-video.",
+    )
+    p.add_argument(
+        "-i", "--image", default=None, metavar="PATH_OR_URL",
+        help="Source image for image-to-video (used as the first frame). "
+             "Local path or http(s) URL.",
+    )
+    p.add_argument(
+        "--ref-image", action="append", default=[], metavar="PATH_OR_URL",
+        help="Reference image for reference-to-video (repeat to pass "
+             "multiple). Refer to them in the prompt as <IMAGE_1>, "
+             "<IMAGE_2>, etc.",
+    )
+    p.add_argument(
+        "--edit-video", default=None, metavar="PATH_OR_URL",
+        help="Source video to edit. Prompt describes the modification.",
+    )
+    p.add_argument(
+        "--extend-video", default=None, metavar="PATH_OR_URL",
+        help="Source video to extend from its last frame. Prompt describes "
+             "what happens next.",
+    )
+    p.add_argument(
+        "-n", "--name", default=None,
+        help="Output filename stem (no extension). Defaults to a timestamp.",
+    )
+    p.add_argument(
+        "--timeout", type=int, default=600,
+        help="Max seconds to wait for generation to complete.",
+    )
+    p.add_argument(
+        "--poll-interval", type=int, default=5,
+        help="Seconds between status polls.",
+    )
+    return p.parse_args()
+
+
+def _is_url(s: str) -> bool:
+    return s.startswith(("http://", "https://", "data:"))
+
+
+def _to_data_uri(ref: str, label: str, default_mime: str) -> str:
+    """Return `ref` as-is if it's already a URL/data URI; otherwise read the
+    local file and encode it as a base64 data URI."""
+    if _is_url(ref):
+        return ref
+    path = Path(ref).expanduser()
+    if not path.is_file():
+        sys.exit(f"error: {label} not found: {path}")
+    mime, _ = mimetypes.guess_type(str(path))
+    if mime is None:
+        mime = default_mime
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def main():
+    args = parse_args()
+
+    if not os.environ.get("XAI_API_KEY"):
+        sys.exit("error: XAI_API_KEY is not set in the environment.")
+
+    # Exactly-one-mode validation for the source-media flags. Text-to-video
+    # is the default when none of these are set.
+    source_flags = {
+        "--image": args.image,
+        "--ref-image": args.ref_image or None,
+        "--edit-video": args.edit_video,
+        "--extend-video": args.extend_video,
+    }
+    active = [k for k, v in source_flags.items() if v]
+    if len(active) > 1:
+        sys.exit(f"error: cannot combine {' and '.join(active)}.")
+
+    if args.duration is not None and not (1 <= args.duration <= 15):
+        sys.exit("error: --duration must be between 1 and 15.")
+
+    out_dir = Path(args.output_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    import xai_sdk
+    from xai_sdk.video import VideoGenerationError
+
+    client = xai_sdk.Client(api_key=os.environ["XAI_API_KEY"])
+
+    poll_kwargs = {
+        "timeout": timedelta(seconds=args.timeout),
+        "interval": timedelta(seconds=args.poll_interval),
+    }
+
+    try:
+        if args.extend_video:
+            # Extend takes video_url positionally; it doesn't accept aspect/
+            # resolution — the output inherits from the input.
+            video_url = _to_data_uri(args.extend_video, "--extend-video", "video/mp4")
+            response = client.video.extend(
+                prompt=args.prompt,
+                model=MODEL,
+                video_url=video_url,
+                duration=args.duration,
+                **poll_kwargs,
+            )
+        else:
+            gen_kwargs = {
+                "prompt": args.prompt,
+                "model": MODEL,
+                "duration": args.duration,
+                **poll_kwargs,
+            }
+            if args.edit_video:
+                gen_kwargs["video_url"] = _to_data_uri(
+                    args.edit_video, "--edit-video", "video/mp4"
+                )
+            else:
+                # edit-video ignores these; only pass them for other modes.
+                if args.aspect_ratio:
+                    gen_kwargs["aspect_ratio"] = args.aspect_ratio
+                if args.resolution:
+                    gen_kwargs["resolution"] = args.resolution
+
+                if args.image:
+                    gen_kwargs["image_url"] = _to_data_uri(
+                        args.image, "--image", "image/png"
+                    )
+                if args.ref_image:
+                    gen_kwargs["reference_image_urls"] = [
+                        _to_data_uri(r, "--ref-image", "image/png")
+                        for r in args.ref_image
+                    ]
+            response = client.video.generate(**gen_kwargs)
+    except VideoGenerationError as e:
+        sys.exit(f"error: generation failed [{e.code}]: {e.message}")
+    except TimeoutError:
+        sys.exit(
+            "error: generation timed out — try increasing --timeout or "
+            "simplifying the prompt."
+        )
+
+    stem = args.name or datetime.now().strftime("xvideo-%Y%m%d-%H%M%S")
+    path = out_dir / f"{stem}.mp4"
+
+    # `response.url` is an ephemeral xAI-hosted URL. Download it to disk.
+    with urllib.request.urlopen(response.url) as src, open(path, "wb") as dst:
+        while True:
+            chunk = src.read(1 << 20)
+            if not chunk:
+                break
+            dst.write(chunk)
+
+    print(path)
+
+
+if __name__ == "__main__":
+    main()
