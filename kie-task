@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Query a Kie AI task by taskId; optionally wait for completion and download results."""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from kie_api import (
+    KieError,
+    download_result_urls,
+    get_api_key,
+    get_task,
+    poll_task,
+    result_urls,
+)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=(
+            "Query the status of a Kie AI task via the unified recordInfo "
+            "endpoint. Prints the task's `data` object as JSON. With "
+            "--wait, polls until the task reaches a terminal state. With "
+            "--download, writes every resultUrl to disk and prints saved "
+            "paths instead of JSON."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("task_id", help="The taskId returned by createTask.")
+    p.add_argument(
+        "-w", "--wait", action="store_true",
+        help="Poll until the task reaches a terminal state (success|fail).",
+    )
+    p.add_argument(
+        "--poll-interval", type=int, default=5,
+        help="Seconds between status polls (with --wait).",
+    )
+    p.add_argument(
+        "--timeout", type=int, default=900,
+        help="Max seconds to wait for a terminal state (with --wait).",
+    )
+    p.add_argument(
+        "-o", "--download", default=None, metavar="DIR",
+        help="Download every resultUrl to this directory. Implies --wait. "
+             "Prints saved paths instead of JSON.",
+    )
+    p.add_argument(
+        "-n", "--name", default=None,
+        help="Output filename stem for downloaded files. Defaults to "
+             "kie-<taskId>-<timestamp>.",
+    )
+    p.add_argument(
+        "--ext", default="mp4",
+        help="Fallback extension for downloads when a URL has none.",
+    )
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    wait = args.wait or args.download is not None
+    try:
+        api_key = get_api_key()
+        if wait:
+            data = poll_task(
+                args.task_id, api_key,
+                poll_interval=args.poll_interval,
+                timeout=args.timeout,
+                on_wait=lambda d: print(
+                    f"task {args.task_id}: state={d.get('state')} "
+                    f"(polling every {args.poll_interval}s)",
+                    file=sys.stderr,
+                ),
+            )
+        else:
+            data = get_task(args.task_id, api_key)
+    except KieError as e:
+        sys.exit(f"error: {e}")
+
+    if args.download is None:
+        print(json.dumps(data, indent=2))
+        return
+
+    try:
+        urls = result_urls(data)
+    except KieError as e:
+        sys.exit(f"error: {e}")
+    if not urls:
+        sys.exit(
+            f"error: task {args.task_id} succeeded but has no resultUrls."
+        )
+
+    out_dir = Path(args.download).expanduser()
+    stem = args.name or datetime.now().strftime(
+        f"kie-{args.task_id}-%Y%m%d-%H%M%S"
+    )
+    try:
+        saved = download_result_urls(
+            urls, out_dir, stem, default_ext=args.ext
+        )
+    except (KieError, OSError) as e:
+        sys.exit(f"error: download failed: {e}")
+
+    for p in saved:
+        print(p)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Upload a local file or URL to Kie AI's temporary file store."""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from kie_api import (
+    KieError,
+    get_api_key,
+    is_url,
+    upload_local_file,
+    upload_url,
+)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=(
+            "Upload a file to Kie AI's temporary store and print the "
+            "returned fileUrl. Local paths use the multipart stream "
+            "endpoint; http(s):// URLs use Kie's url-upload (Kie fetches "
+            "the remote file and re-hosts it). Uploaded files expire after "
+            "3 days."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("source", help="Local file path or http(s):// URL to upload.")
+    p.add_argument(
+        "--path", default=None,
+        help="Remote 'uploadPath' (directory) on Kie's store.",
+    )
+    p.add_argument(
+        "--name", default=None,
+        help="Remote 'fileName'. If omitted, Kie auto-generates one. "
+             "Supplying the same name overwrites any existing file.",
+    )
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    try:
+        api_key = get_api_key()
+        if is_url(args.source):
+            url = upload_url(
+                args.source, api_key,
+                upload_path=args.path, file_name=args.name,
+            )
+        else:
+            url = upload_local_file(
+                Path(args.source).expanduser(), api_key,
+                upload_path=args.path, file_name=args.name,
+            )
+    except KieError as e:
+        sys.exit(f"error: {e}")
+    print(url)
+
+
+if __name__ == "__main__":
+    main()
